@@ -115,6 +115,68 @@ store.load_from_mongodb_split(
 )
 ```
 
+### 6-1) 실제 MongoDB 문서 저장 예시
+
+아래는 `contentId = "C001"`인 데이터가 저장되는 예시입니다.
+
+#### metadata collection (`content_metadata`)
+
+```json
+{
+  "contentId": "C001",
+  "contentNm": "매출 개선 전략",
+  "contentDesc": "전환율 향상을 위한 마케팅 캠페인",
+  "contentGC": "A",
+  "contentCusGC": "B",
+  "contentPeriod": "2025Q1",
+  "contentObject": "매출",
+  "contentAction": "캠페인",
+  "contentMetric": "전환율"
+}
+```
+
+#### embedding collection (`content_embeddings`)
+
+embedding mode(`build_embeddings(mode=...)`)에 따라 문서 형태가 달라집니다.
+
+1) `mode="concat"`
+
+```json
+{
+  "contentId": "C001",
+  "concat_embedding": [0.12, -0.03, 0.55, -0.21]
+}
+```
+
+2) `mode="per_key"`
+
+```json
+{
+  "contentId": "C001",
+  "field_embeddings": {
+    "contentNm": [0.01, 0.12, -0.05, 0.89],
+    "contentDesc": [0.45, -0.11, 0.03, 0.22],
+    "contentMetric": [0.31, 0.09, -0.28, 0.10]
+  }
+}
+```
+
+3) `mode="both"`
+
+```json
+{
+  "contentId": "C001",
+  "concat_embedding": [0.12, -0.03, 0.55, -0.21],
+  "field_embeddings": {
+    "contentNm": [0.01, 0.12, -0.05, 0.89],
+    "contentDesc": [0.45, -0.11, 0.03, 0.22],
+    "contentMetric": [0.31, 0.09, -0.28, 0.10]
+  }
+}
+```
+
+> 참고: 실제 벡터 길이는 사용 중인 임베딩 모델 차원(`mock_dimension` 또는 API 모델 차원)과 동일합니다.
+
 ## 7) 디버깅 순서 추천
 
 1. `load_from_json` 또는 `load_from_mongodb`/`load_from_mongodb_split`
