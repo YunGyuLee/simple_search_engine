@@ -53,6 +53,7 @@ class search_store:
     # Data Load / Save
     # -------------------------------
     def load_from_json(self, json_path: str | Path) -> None:
+        """JSON 파일에서 contents를 로드하고 검증 후 저장한다."""
         path = Path(json_path)
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, list):
@@ -61,58 +62,46 @@ class search_store:
 
     def load_from_mongodb(
         self,
-        mongo_uri: str,
+        mongo_client: Any,
         db_name: str,
         collection_name: str,
         query: dict[str, Any] | None = None,
         limit: int | None = None,
     ) -> None:
-        try:
-            from pymongo import MongoClient
-        except ImportError as exc:
-            raise ImportError("pymongo가 필요합니다. `pip install pymongo` 후 재시도하세요.") from exc
-
+        """외부에서 생성한 MongoClient를 받아 contents를 로드한다."""
         query = query or {}
-        with MongoClient(mongo_uri) as client:
-            collection = client[db_name][collection_name]
-            cursor = collection.find(query)
-            if limit:
-                cursor = cursor.limit(limit)
-            items = []
-            for row in cursor:
-                row.pop("_id", None)
-                items.append(row)
+        collection = mongo_client[db_name][collection_name]
+
+        cursor = collection.find(query)
+        if limit:
+            cursor = cursor.limit(limit)
+
+        rows = list(cursor)
+        items = [self._normalize_mongo_row(row) for row in rows]
         self._set_contents(items)
 
     def save_contents_to_mongodb(
         self,
-        mongo_uri: str,
+        mongo_client: Any,
         db_name: str,
         collection_name: str,
         replace_by_content_id: bool = True,
     ) -> None:
-        try:
-            from pymongo import MongoClient, UpdateOne
-        except ImportError as exc:
-            raise ImportError("pymongo가 필요합니다. `pip install pymongo` 후 재시도하세요.") from exc
+        """외부 MongoClient를 사용해 현재 contents를 MongoDB에 저장한다."""
+        if not self.contents:
+            return
 
-        with MongoClient(mongo_uri) as client:
-            collection = client[db_name][collection_name]
-            if replace_by_content_id:
-                ops = []
-                for content in self.contents:
-                    ops.append(
-                        UpdateOne(
-                            {"contentId": content["contentId"]},
-                            {"$set": content},
-                            upsert=True,
-                        )
-                    )
-                if ops:
-                    collection.bulk_write(ops, ordered=False)
-            else:
-                if self.contents:
-                    collection.insert_many(self.contents)
+        collection = mongo_client[db_name][collection_name]
+
+        if replace_by_content_id:
+            ops = [
+                self._build_upsert_operation(content)
+                for content in self.contents
+            ]
+            collection.bulk_write(ops, ordered=False)
+            return
+
+        collection.insert_many(self.contents)
 
     # -------------------------------
     # Embedding
@@ -129,25 +118,15 @@ class search_store:
           - per_key: key별 개별 임베딩
           - both: 둘 다
         """
-        if not self.contents:
-            raise ValueError("contents가 비어 있습니다. 먼저 DB/JSON을 로드하세요.")
-
+        self._validate_before_embedding(mode)
         concat_keys = list(concat_keys or REQUIRED_CONTENT_KEYS)
         per_key_fields = list(per_key_fields or REQUIRED_CONTENT_KEYS)
 
         if mode in ("concat", "both"):
-            self.concat_texts = [self._concat_content_text(c, concat_keys) for c in self.contents]
-            self.concat_embeddings = self._embed_texts(self.concat_texts)
-            self.concat_embeddings_norm = self._row_norm(self.concat_embeddings)
+            self._build_concat_embeddings(concat_keys)
 
         if mode in ("per_key", "both"):
-            self.field_embeddings.clear()
-            self.field_embeddings_norm.clear()
-            for field in per_key_fields:
-                texts = [self._to_text(c.get(field, "")) for c in self.contents]
-                matrix = self._embed_texts(texts)
-                self.field_embeddings[field] = matrix
-                self.field_embeddings_norm[field] = self._row_norm(matrix)
+            self._build_per_key_embeddings(per_key_fields)
 
         self._content_ids = [str(c["contentId"]) for c in self.contents]
 
@@ -163,7 +142,48 @@ class search_store:
             if missing:
                 raise ValueError(f"index={idx} 데이터에 필수 key 누락: {missing}")
             normalized.append(content)
+
         self.contents = normalized
+
+    @staticmethod
+    def _normalize_mongo_row(row: dict[str, Any]) -> dict[str, Any]:
+        row = dict(row)
+        row.pop("_id", None)
+        return row
+
+    @staticmethod
+    def _build_upsert_operation(content: dict[str, Any]) -> Any:
+        try:
+            from pymongo import UpdateOne
+        except ImportError as exc:
+            raise ImportError("pymongo가 필요합니다. `pip install pymongo` 후 재시도하세요.") from exc
+
+        return UpdateOne(
+            {"contentId": content["contentId"]},
+            {"$set": content},
+            upsert=True,
+        )
+
+    def _validate_before_embedding(self, mode: str) -> None:
+        if mode not in ("concat", "per_key", "both"):
+            raise ValueError("mode는 'concat', 'per_key', 'both' 중 하나여야 합니다.")
+        if not self.contents:
+            raise ValueError("contents가 비어 있습니다. 먼저 DB/JSON을 로드하세요.")
+
+    def _build_concat_embeddings(self, concat_keys: list[str]) -> None:
+        self.concat_texts = [self._concat_content_text(c, concat_keys) for c in self.contents]
+        self.concat_embeddings = self._embed_texts(self.concat_texts)
+        self.concat_embeddings_norm = self._row_norm(self.concat_embeddings)
+
+    def _build_per_key_embeddings(self, per_key_fields: list[str]) -> None:
+        self.field_embeddings.clear()
+        self.field_embeddings_norm.clear()
+
+        for field in per_key_fields:
+            texts = [self._to_text(c.get(field, "")) for c in self.contents]
+            matrix = self._embed_texts(texts)
+            self.field_embeddings[field] = matrix
+            self.field_embeddings_norm[field] = self._row_norm(matrix)
 
     @staticmethod
     def _to_text(value: Any) -> str:
@@ -262,8 +282,7 @@ class search_engine:
         return dots / (matrix_norm * query_norm)
 
     def search_concat(self, keyword: str, top_k: int = 10) -> list[dict[str, Any]]:
-        if self.search_store.concat_embeddings is None or self.search_store.concat_embeddings_norm is None:
-            raise ValueError("concat 임베딩이 없습니다. search_store.build_embeddings(mode='concat' or 'both')를 먼저 호출하세요.")
+        self._validate_concat_ready()
 
         query_vec = np.asarray(self.search_store._embed_single_text(keyword), dtype=np.float32)
         scores = self.cosine_similarity(
@@ -279,9 +298,7 @@ class search_engine:
         weight_by_field: dict[str, float] | None = None,
         top_k: int = 10,
     ) -> list[dict[str, Any]]:
-        if not self.search_store.field_embeddings:
-            raise ValueError("per_key 임베딩이 없습니다. search_store.build_embeddings(mode='per_key' or 'both')를 먼저 호출하세요.")
-
+        self._validate_per_key_ready()
         weight_by_field = weight_by_field or {}
 
         final_scores: np.ndarray | None = None
@@ -291,8 +308,8 @@ class search_engine:
             if field not in self.search_store.field_embeddings:
                 raise KeyError(f"field='{field}' 임베딩이 없습니다.")
 
-            w = float(weight_by_field.get(field, 1.0))
-            if w <= 0:
+            weight = float(weight_by_field.get(field, 1.0))
+            if weight <= 0:
                 continue
 
             query_vec = np.asarray(self.search_store._embed_single_text(keyword), dtype=np.float32)
@@ -302,17 +319,13 @@ class search_engine:
                 matrix_norm=self.search_store.field_embeddings_norm[field],
             )
 
-            if final_scores is None:
-                final_scores = w * field_scores
-            else:
-                final_scores += w * field_scores
-            weight_sum += w
+            final_scores = field_scores * weight if final_scores is None else final_scores + (field_scores * weight)
+            weight_sum += weight
 
         if final_scores is None or weight_sum == 0:
             raise ValueError("유효한 keyword/weight 조합이 없습니다.")
 
-        final_scores /= weight_sum
-        return self._top_k(final_scores, top_k)
+        return self._top_k(final_scores / weight_sum, top_k)
 
     def search(
         self,
@@ -334,11 +347,18 @@ class search_engine:
             top_k=top_k,
         )
 
+    def _validate_concat_ready(self) -> None:
+        if self.search_store.concat_embeddings is None or self.search_store.concat_embeddings_norm is None:
+            raise ValueError("concat 임베딩이 없습니다. search_store.build_embeddings(mode='concat' or 'both')를 먼저 호출하세요.")
+
+    def _validate_per_key_ready(self) -> None:
+        if not self.search_store.field_embeddings:
+            raise ValueError("per_key 임베딩이 없습니다. search_store.build_embeddings(mode='per_key' or 'both')를 먼저 호출하세요.")
+
     def _top_k(self, scores: np.ndarray, top_k: int) -> list[dict[str, Any]]:
         n = len(self.search_store.contents)
         k = max(1, min(top_k, n))
 
-        # argpartition으로 O(n) 근사 선택 후 상위 k 정렬
         idx = np.argpartition(-scores, k - 1)[:k]
         idx = idx[np.argsort(-scores[idx])]
 

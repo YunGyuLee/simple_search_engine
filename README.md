@@ -10,9 +10,7 @@
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install numpy requests
-# MongoDB 기능이 필요하면
-pip install pymongo
+pip install -r requirements.txt
 ```
 
 ## 2) content 형식
@@ -84,19 +82,35 @@ result2 = engine_per_key.search(
 
 개발/테스트를 위해 `provider=mock` 또는 `api_url=mock`이면 해시 기반 deterministic 임베딩을 사용합니다.
 
-## 5) MongoDB 사용
+## 5) MongoDB 사용 (외부에서 client 생성 후 전달)
 
 ```python
+from pymongo import MongoClient
+from simple_search import search_store
+
+client = MongoClient("mongodb://localhost:27017")
+
+store = search_store(embedding_model={"provider": "mock", "api_url": "mock"})
 store.load_from_mongodb(
-    mongo_uri="mongodb://localhost:27017",
+    mongo_client=client,
     db_name="search_db",
     collection_name="contents",
 )
 
 store.save_contents_to_mongodb(
-    mongo_uri="mongodb://localhost:27017",
+    mongo_client=client,
     db_name="search_db",
     collection_name="contents",
     replace_by_content_id=True,
 )
 ```
+
+## 6) 디버깅 순서 추천
+
+아래 순서대로 호출하면 디버깅이 쉽습니다.
+
+1. `load_from_json` 또는 `load_from_mongodb`
+2. `build_embeddings(mode="concat" | "per_key" | "both")`
+3. `search_engine(...).search(...)`
+
+클래스 내부도 위 순서와 동일하게 단계별 보조 메소드로 분리되어 있어, 오류가 나도 어느 단계에서 실패했는지 빠르게 확인할 수 있습니다.
