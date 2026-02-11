@@ -1,0 +1,11 @@
+{
+  "embedding_mode": "concat",
+  "embedding_model": {
+    "provider": "mock",
+    "api_url": "mock",
+    "api_key": "",
+    "model": "",
+    "timeout": 10,
+    "mock_dimension": 64
+  }
+}
