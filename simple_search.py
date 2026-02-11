@@ -212,20 +212,27 @@ class search_store:
         collection: Any,
         content_id: str,
         concat_keys: Iterable[str] | None = None,
+        concat_key_groups: dict[str, Iterable[str]] | None = None,
         per_key_fields: Iterable[str] | None = None,
         embedding_field: str = "embeddings",
     ) -> dict[str, Any]:
-        """input: collection/id/keys..., output: payload, desc: 단건 임베딩 생성 후 문서 저장."""
+        """input: collection/id/keys..., output: payload, desc: 단건 임베딩 생성 후 문서 저장(다중 concat 조합 지원)."""
         item = self.read_content(collection, content_id)
         if item is None:
             raise KeyError(f"content_id='{content_id}' 문서를 찾지 못했습니다.")
 
         all_keys = sorted(item.keys())
-        use_concat_keys = list(concat_keys) if concat_keys else all_keys
+        groups = self._resolve_concat_key_groups(concat_keys=concat_keys, concat_key_groups=concat_key_groups, fallback_keys=all_keys)
         use_per_key_fields = list(per_key_fields) if per_key_fields else all_keys
 
-        concat_text = self._build_concat_text(item, use_concat_keys)
-        concat_vector = self.embedding_client.embed_text(concat_text).astype(np.float32).tolist()
+        concat_by_combo: dict[str, dict[str, Any]] = {}
+        for combo_name, keys in groups.items():
+            text = self._build_concat_text(item, keys)
+            vector = self.embedding_client.embed_text(text).astype(np.float32).tolist()
+            concat_by_combo[combo_name] = {"keys": keys, "vector": vector}
+
+        default_keys = groups["default"]
+        default_vector = concat_by_combo["default"]["vector"]
 
         per_key: dict[str, list[float]] = {}
         for field in use_per_key_fields:
@@ -233,8 +240,9 @@ class search_store:
             per_key[field] = vector.astype(np.float32).tolist()
 
         payload = {
-            "concat": concat_vector,
-            "concat_meta": {"keys": use_concat_keys},
+            "concat": default_vector,
+            "concat_meta": {"keys": default_keys},
+            "concat_by_combo": concat_by_combo,
             "per_key": per_key,
         }
         collection.update_one({self.id_key: content_id}, {"$set": {embedding_field: payload}})
@@ -246,11 +254,12 @@ class search_store:
         query: dict[str, Any] | None = None,
         limit: int | None = None,
         concat_keys: Iterable[str] | None = None,
+        concat_key_groups: dict[str, Iterable[str]] | None = None,
         per_key_fields: Iterable[str] | None = None,
         embedding_field: str = "embeddings",
         skip_if_embedding_exists: bool = True,
     ) -> int:
-        """input: collection/query/keys..., output: int, desc: 벌크 임베딩 후 문서 업데이트."""
+        """input: collection/query/keys..., output: int, desc: 벌크 임베딩 후 문서 업데이트(다중 concat 조합 지원)."""
         self.load_contents_from_mongodb(
             collection,
             query=query,
@@ -266,7 +275,7 @@ class search_store:
             return 0
 
         all_keys = sorted(self._collect_content_keys(work_items))
-        use_concat_keys = list(concat_keys) if concat_keys else all_keys
+        groups = self._resolve_concat_key_groups(concat_keys=concat_keys, concat_key_groups=concat_key_groups, fallback_keys=all_keys)
         use_per_key_fields = list(per_key_fields) if per_key_fields else all_keys
 
         from pymongo import UpdateOne
@@ -276,8 +285,14 @@ class search_store:
             if self.id_key not in item:
                 continue
 
-            concat_text = self._build_concat_text(item, use_concat_keys)
-            concat_vector = self.embedding_client.embed_text(concat_text).astype(np.float32).tolist()
+            concat_by_combo: dict[str, dict[str, Any]] = {}
+            for combo_name, keys in groups.items():
+                text = self._build_concat_text(item, keys)
+                vector = self.embedding_client.embed_text(text).astype(np.float32).tolist()
+                concat_by_combo[combo_name] = {"keys": keys, "vector": vector}
+
+            default_keys = groups["default"]
+            default_vector = concat_by_combo["default"]["vector"]
 
             per_key_payload: dict[str, list[float]] = {}
             for field in use_per_key_fields:
@@ -285,8 +300,9 @@ class search_store:
                 per_key_payload[field] = vector.astype(np.float32).tolist()
 
             payload = {
-                "concat": concat_vector,
-                "concat_meta": {"keys": use_concat_keys},
+                "concat": default_vector,
+                "concat_meta": {"keys": default_keys},
+                "concat_by_combo": concat_by_combo,
                 "per_key": per_key_payload,
             }
             ops.append(UpdateOne({self.id_key: item[self.id_key]}, {"$set": {embedding_field: payload}}))
@@ -324,6 +340,16 @@ class search_store:
                     concat_keys_candidate = current_keys
                 elif concat_keys_candidate != current_keys:
                     concat_keys_candidate = []
+
+            concat_by_combo = embedded.get("concat_by_combo")
+            if isinstance(concat_by_combo, dict) and "default" in concat_by_combo:
+                default_info = concat_by_combo.get("default")
+                if isinstance(default_info, dict) and isinstance(default_info.get("keys"), list):
+                    current_keys = [str(k) for k in default_info["keys"]]
+                    if concat_keys_candidate is None:
+                        concat_keys_candidate = current_keys
+                    elif concat_keys_candidate != current_keys:
+                        concat_keys_candidate = []
 
             per_key = embedded.get("per_key", {})
             if isinstance(per_key, dict):
@@ -376,6 +402,24 @@ class search_store:
         for item in items:
             keys.update(item.keys())
         return keys
+
+    @staticmethod
+    def _resolve_concat_key_groups(
+        concat_keys: Iterable[str] | None,
+        concat_key_groups: dict[str, Iterable[str]] | None,
+        fallback_keys: list[str],
+    ) -> dict[str, list[str]]:
+        """input: concat_keys/groups/fallback, output: groups dict, desc: concat 조합 정의를 표준화한다."""
+        base_keys = list(concat_keys) if concat_keys else list(fallback_keys)
+
+        if not concat_key_groups:
+            return {"default": base_keys}
+
+        groups = {str(name): list(keys) for name, keys in concat_key_groups.items()}
+        if "default" not in groups:
+            groups["default"] = base_keys
+        return groups
+
 
     @staticmethod
     def _stringify_value_for_embedding(value: Any) -> str:

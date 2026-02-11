@@ -63,7 +63,7 @@ store.build_embeddings(mode="concat", reuse_cached_embeddings=True, embedding_fi
 ## 4) concat 조합 key 정보 저장
 
 `embed_content_by_id` / `embed_contents_bulk`로 저장할 때,
-concat 임베딩에 어떤 key 조합을 사용했는지 `concat_meta.keys`로 함께 저장됩니다.
+concat 임베딩에 어떤 key 조합을 사용했는지 저장하며, 필요 시 여러 조합을 `concat_by_combo`로 함께 저장할 수 있습니다.
 
 ```json
 {
@@ -73,12 +73,36 @@ concat 임베딩에 어떤 key 조합을 사용했는지 `concat_meta.keys`로 �
     "concat_meta": {
       "keys": ["contentNm", "contentDesc"]
     },
+    "concat_by_combo": {
+      "default": {
+        "keys": ["contentNm", "contentDesc"],
+        "vector": [0.12, -0.03, 0.55, -0.21]
+      },
+      "nm_period": {
+        "keys": ["contentNm", "contentPeriod"],
+        "vector": [0.05, 0.77, -0.11, 0.21]
+      }
+    },
     "per_key": {
       "contentNm": [0.01, 0.12, -0.05, 0.89],
       "contentDesc": [0.45, -0.11, 0.03, 0.22]
     }
   }
 }
+```
+
+
+여러 조합 저장 예시:
+
+```python
+store.embed_contents_bulk(
+    collection=col,
+    concat_key_groups={
+        "default": ["contentNm", "contentDesc"],
+        "nm_period": ["contentNm", "contentPeriod"],
+    },
+    embedding_field="embeddings",
+)
 ```
 
 ## 5) search_store API 요약
