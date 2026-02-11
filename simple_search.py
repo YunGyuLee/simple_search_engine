@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from hashlib import sha256
 import json
 from pathlib import Path
 from typing import Any, Iterable
@@ -12,30 +11,26 @@ import requests
 
 @dataclass(slots=True)
 class EmbeddingClient:
-    """외부 임베딩 API(또는 mock)를 호출하는 클라이언트."""
+    """외부 임베딩 API 호출 전담 클라이언트."""
 
-    api_url: str = "mock"
+    api_url: str
     api_key: str | None = None
     model: str | None = None
     timeout: float = 10.0
-    provider: str = "generic"
-    mock_dimension: int = 64
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any]) -> "EmbeddingClient":
+        api_url = cfg.get("api_url")
+        if not api_url:
+            raise ValueError("embedding_model.api_url이 필요합니다.")
         return cls(
-            api_url=str(cfg.get("api_url", "mock")),
+            api_url=str(api_url),
             api_key=cfg.get("api_key"),
             model=cfg.get("model"),
             timeout=float(cfg.get("timeout", 10.0)),
-            provider=str(cfg.get("provider", "generic")),
-            mock_dimension=int(cfg.get("mock_dimension", 64)),
         )
 
     def embed_text(self, text: str) -> np.ndarray:
-        if self.provider == "mock" or self.api_url == "mock":
-            return np.asarray(self._mock_embedding(text), dtype=np.float32)
-
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -59,34 +54,32 @@ class EmbeddingClient:
         raise ValueError("Embedding API 응답에서 embedding 벡터를 찾지 못했습니다.")
 
     def embed_texts(self, texts: list[str]) -> np.ndarray:
-        return np.asarray([self.embed_text(t) for t in texts], dtype=np.float32)
-
-    def _mock_embedding(self, text: str) -> list[float]:
-        digest = sha256(text.encode("utf-8")).digest()
-        return [((digest[i % len(digest)] / 255.0) * 2 - 1) for i in range(self.mock_dimension)]
+        vectors = [self.embed_text(t) for t in texts]
+        return np.asarray(vectors, dtype=np.float32)
 
 
 class search_store:
-    """content 저장/로드, Mongo CRUD, 임베딩 인덱스 관리를 담당."""
+    """ID 기준 Mongo CRUD + 벌크 load/save + 임베딩 인덱스 관리."""
 
     def __init__(self, embedding_client: EmbeddingClient, id_key: str = "contentId") -> None:
         self.embedding_client = embedding_client
         self.id_key = id_key
 
         self.contents: list[dict[str, Any]] = []
+        self.content_ids: list[str] = []
+
         self.concat_texts: list[str] = []
         self.concat_embeddings: np.ndarray | None = None
         self.concat_embeddings_norm: np.ndarray | None = None
         self.field_embeddings: dict[str, np.ndarray] = {}
         self.field_embeddings_norm: dict[str, np.ndarray] = {}
-        self.content_ids: list[str] = []
 
-    # ---------- content load/save ----------
+    # ---------- bulk load/save ----------
     def set_contents(self, items: list[dict[str, Any]]) -> None:
-        if any(not isinstance(x, dict) for x in items):
+        if any(not isinstance(item, dict) for item in items):
             raise ValueError("contents는 List[dict] 형태여야 합니다.")
         self.contents = items
-        self.content_ids = [str(c[self.id_key]) for c in self.contents if self.id_key in c]
+        self.content_ids = [str(item[self.id_key]) for item in items if self.id_key in item]
 
     def load_contents_from_json(self, json_path: str | Path) -> None:
         data = json.loads(Path(json_path).read_text(encoding="utf-8"))
@@ -98,7 +91,8 @@ class search_store:
         cursor = collection.find(query or {})
         if limit:
             cursor = cursor.limit(limit)
-        rows = []
+
+        rows: list[dict[str, Any]] = []
         for row in cursor:
             row = dict(row)
             row.pop("_id", None)
@@ -108,31 +102,33 @@ class search_store:
     def save_contents_to_mongodb(self, collection: Any, upsert: bool = True) -> None:
         if not self.contents:
             return
+
         if upsert:
             from pymongo import UpdateOne
 
             ops = []
-            for c in self.contents:
-                if self.id_key not in c:
-                    raise KeyError(f"'{self.id_key}'가 없는 content는 저장할 수 없습니다.")
-                ops.append(UpdateOne({self.id_key: c[self.id_key]}, {"$set": c}, upsert=True))
+            for item in self.contents:
+                if self.id_key not in item:
+                    raise KeyError(f"'{self.id_key}'가 없는 데이터는 저장할 수 없습니다.")
+                ops.append(UpdateOne({self.id_key: item[self.id_key]}, {"$set": item}, upsert=True))
             if ops:
                 collection.bulk_write(ops, ordered=False)
             return
+
         collection.insert_many(self.contents)
 
-    # ---------- Mongo CRUD by id ----------
+    # ---------- CRUD by id ----------
     def create_content(self, collection: Any, content: dict[str, Any], upsert: bool = False) -> None:
         if self.id_key not in content:
             raise KeyError(f"'{self.id_key}'가 필요합니다.")
         if upsert:
             collection.update_one({self.id_key: content[self.id_key]}, {"$set": content}, upsert=True)
-        else:
-            collection.insert_one(content)
+            return
+        collection.insert_one(content)
 
     def read_content(self, collection: Any, content_id: str) -> dict[str, Any] | None:
         row = collection.find_one({self.id_key: content_id})
-        if not row:
+        if row is None:
             return None
         row = dict(row)
         row.pop("_id", None)
@@ -158,108 +154,94 @@ class search_store:
         if mode not in {"concat", "per_key", "both"}:
             raise ValueError("mode는 'concat' | 'per_key' | 'both' 이어야 합니다.")
 
+        all_keys = sorted(self._all_keys())
+
         if mode in {"concat", "both"}:
-            keys = list(concat_keys) if concat_keys else sorted(self._all_keys())
-            self.concat_texts = [self._concat_text(c, keys) for c in self.contents]
+            keys = list(concat_keys) if concat_keys else all_keys
+            self.concat_texts = [self._concat_text(item, keys) for item in self.contents]
             self.concat_embeddings = self.embedding_client.embed_texts(self.concat_texts)
             self.concat_embeddings_norm = self._row_norm(self.concat_embeddings)
 
         if mode in {"per_key", "both"}:
-            fields = list(per_key_fields) if per_key_fields else sorted(self._all_keys())
+            fields = list(per_key_fields) if per_key_fields else all_keys
             self.field_embeddings.clear()
             self.field_embeddings_norm.clear()
             for field in fields:
-                texts = [self._to_text(c.get(field, "")) for c in self.contents]
+                texts = [self._to_text(item.get(field, "")) for item in self.contents]
                 matrix = self.embedding_client.embed_texts(texts)
                 self.field_embeddings[field] = matrix
                 self.field_embeddings_norm[field] = self._row_norm(matrix)
 
-        self.content_ids = [str(c[self.id_key]) for c in self.contents if self.id_key in c]
+        self.content_ids = [str(item[self.id_key]) for item in self.contents if self.id_key in item]
 
-    def save_to_mongodb_split(self, metadata_collection: Any, embedding_collection: Any, upsert: bool = True) -> None:
-        if not self.contents:
-            return
-
-        metadata_docs = [dict(c) for c in self.contents]
-        embedding_docs: list[dict[str, Any]] = []
-        n = len(self.contents)
-
-        for i, c in enumerate(self.contents):
-            if self.id_key not in c:
-                raise KeyError(f"'{self.id_key}'가 없는 content는 split 저장할 수 없습니다.")
-            doc: dict[str, Any] = {self.id_key: c[self.id_key]}
-            if self.concat_embeddings is not None and len(self.concat_embeddings) == n:
-                doc["concat_embedding"] = self.concat_embeddings[i].astype(np.float32).tolist()
-            if self.field_embeddings:
-                per_field: dict[str, list[float]] = {}
-                for field, matrix in self.field_embeddings.items():
-                    if len(matrix) == n:
-                        per_field[field] = matrix[i].astype(np.float32).tolist()
-                if per_field:
-                    doc["field_embeddings"] = per_field
-            embedding_docs.append(doc)
-
-        self._write_docs_by_id(metadata_collection, metadata_docs, upsert)
-        self._write_docs_by_id(embedding_collection, embedding_docs, upsert)
-
-    def load_from_mongodb_split(
+    def embed_content_by_id(
         self,
-        metadata_collection: Any,
-        embedding_collection: Any,
+        collection: Any,
+        content_id: str,
+        concat_keys: Iterable[str] | None = None,
+        per_key_fields: Iterable[str] | None = None,
+        embedding_field: str = "embeddings",
+    ) -> dict[str, Any]:
+        item = self.read_content(collection, content_id)
+        if item is None:
+            raise KeyError(f"content_id='{content_id}' 문서를 찾지 못했습니다.")
+
+        all_keys = sorted(item.keys())
+        concat_keys = list(concat_keys) if concat_keys else all_keys
+        per_key_fields = list(per_key_fields) if per_key_fields else all_keys
+
+        concat_text = self._concat_text(item, concat_keys)
+        concat_vector = self.embedding_client.embed_text(concat_text).astype(np.float32).tolist()
+
+        per_key: dict[str, list[float]] = {}
+        for field in per_key_fields:
+            vector = self.embedding_client.embed_text(self._to_text(item.get(field, "")))
+            per_key[field] = vector.astype(np.float32).tolist()
+
+        payload = {"concat": concat_vector, "per_key": per_key}
+        collection.update_one({self.id_key: content_id}, {"$set": {embedding_field: payload}})
+        return payload
+
+    def embed_contents_bulk(
+        self,
+        collection: Any,
         query: dict[str, Any] | None = None,
         limit: int | None = None,
-    ) -> None:
-        self.load_contents_from_mongodb(metadata_collection, query=query, limit=limit)
+        concat_keys: Iterable[str] | None = None,
+        per_key_fields: Iterable[str] | None = None,
+        embedding_field: str = "embeddings",
+    ) -> int:
+        self.load_contents_from_mongodb(collection, query=query, limit=limit)
         if not self.contents:
-            return
+            return 0
 
-        ids = [c[self.id_key] for c in self.contents if self.id_key in c]
-        embed_docs = list(embedding_collection.find({self.id_key: {"$in": ids}}))
-        embed_by_id = {doc[self.id_key]: doc for doc in embed_docs if self.id_key in doc}
+        self.build_embeddings(mode="both", concat_keys=concat_keys, per_key_fields=per_key_fields)
 
-        concat_rows: list[list[float]] = []
-        concat_ok = True
-        field_rows: dict[str, list[list[float]]] = {}
+        from pymongo import UpdateOne
 
-        for c in self.contents:
-            cid = c.get(self.id_key)
-            doc = embed_by_id.get(cid)
-            if not doc:
-                concat_ok = False
+        ops = []
+        for idx, item in enumerate(self.contents):
+            if self.id_key not in item:
                 continue
+            per_key_payload = {
+                field: self.field_embeddings[field][idx].astype(np.float32).tolist()
+                for field in self.field_embeddings
+            }
+            payload = {
+                "concat": self.concat_embeddings[idx].astype(np.float32).tolist() if self.concat_embeddings is not None else None,
+                "per_key": per_key_payload,
+            }
+            ops.append(UpdateOne({self.id_key: item[self.id_key]}, {"$set": {embedding_field: payload}}))
 
-            vec = doc.get("concat_embedding")
-            if isinstance(vec, list):
-                concat_rows.append(vec)
-            else:
-                concat_ok = False
-
-            fields = doc.get("field_embeddings", {})
-            if isinstance(fields, dict):
-                for field, fvec in fields.items():
-                    if isinstance(fvec, list):
-                        field_rows.setdefault(field, []).append(fvec)
-
-        if concat_ok and len(concat_rows) == len(self.contents):
-            self.concat_embeddings = np.asarray(concat_rows, dtype=np.float32)
-            self.concat_embeddings_norm = self._row_norm(self.concat_embeddings)
-
-        self.field_embeddings.clear()
-        self.field_embeddings_norm.clear()
-        for field, rows in field_rows.items():
-            if len(rows) != len(self.contents):
-                continue
-            matrix = np.asarray(rows, dtype=np.float32)
-            self.field_embeddings[field] = matrix
-            self.field_embeddings_norm[field] = self._row_norm(matrix)
-
-        self.content_ids = [str(c[self.id_key]) for c in self.contents if self.id_key in c]
+        if ops:
+            collection.bulk_write(ops, ordered=False)
+        return len(ops)
 
     # ---------- internal ----------
     def _all_keys(self) -> set[str]:
         keys: set[str] = set()
-        for c in self.contents:
-            keys.update(c.keys())
+        for item in self.contents:
+            keys.update(item.keys())
         return keys
 
     @staticmethod
@@ -270,27 +252,16 @@ class search_store:
             return value
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
-    def _concat_text(self, content: dict[str, Any], keys: Iterable[str]) -> str:
-        return " ".join(self._to_text(content.get(k, "")) for k in keys).strip()
+    def _concat_text(self, item: dict[str, Any], keys: Iterable[str]) -> str:
+        return " ".join(self._to_text(item.get(k, "")) for k in keys).strip()
 
     @staticmethod
     def _row_norm(matrix: np.ndarray) -> np.ndarray:
         return np.linalg.norm(matrix, axis=1) + 1e-12
 
-    def _write_docs_by_id(self, collection: Any, docs: list[dict[str, Any]], upsert: bool) -> None:
-        if not docs:
-            return
-        if upsert:
-            from pymongo import UpdateOne
-
-            ops = [UpdateOne({self.id_key: d[self.id_key]}, {"$set": d}, upsert=True) for d in docs]
-            collection.bulk_write(ops, ordered=False)
-            return
-        collection.insert_many(docs)
-
 
 class search_engine:
-    """search_store의 인덱스를 사용해 코사인 유사도 검색을 수행."""
+    """search_store 인덱스를 활용한 코사인 유사도 검색 엔진."""
 
     def __init__(self, embedding_mode: str, store: search_store, embedding_client: EmbeddingClient) -> None:
         if embedding_mode not in {"concat", "per_key"}:
@@ -306,14 +277,14 @@ class search_engine:
         client = EmbeddingClient.from_config(config.get("embedding_model", {}))
         return cls(mode, store, client)
 
-    def cosine_similarity(self, query_vector: np.ndarray, matrix: np.ndarray, matrix_norm: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def cosine_similarity(query_vector: np.ndarray, matrix: np.ndarray, matrix_norm: np.ndarray) -> np.ndarray:
         query_norm = float(np.linalg.norm(query_vector) + 1e-12)
         return (matrix @ query_vector) / (matrix_norm * query_norm)
 
     def search_concat(self, keyword: str, top_k: int = 10) -> list[dict[str, Any]]:
         if self.search_store.concat_embeddings is None or self.search_store.concat_embeddings_norm is None:
             raise ValueError("concat 임베딩이 없습니다. build_embeddings(mode='concat' or 'both')를 먼저 호출하세요.")
-
         q = self.embedding_client.embed_text(keyword)
         scores = self.cosine_similarity(q, self.search_store.concat_embeddings, self.search_store.concat_embeddings_norm)
         return self._top_k(scores, top_k)
@@ -336,6 +307,7 @@ class search_engine:
             norms = self.search_store.field_embeddings_norm.get(field)
             if matrix is None or norms is None:
                 continue
+
             weight = float(weight_by_field.get(field, 1.0))
             if weight <= 0:
                 continue
@@ -347,7 +319,6 @@ class search_engine:
 
         if final_scores is None or weight_sum == 0:
             raise ValueError("유효한 keyword/weight 조합이 없습니다.")
-
         return self._top_k(final_scores / weight_sum, top_k)
 
     def search(
@@ -370,6 +341,7 @@ class search_engine:
         n = len(self.search_store.contents)
         if n == 0:
             return []
+
         k = max(1, min(top_k, n))
         idx = np.argpartition(-scores, k - 1)[:k]
         idx = idx[np.argsort(-scores[idx])]
