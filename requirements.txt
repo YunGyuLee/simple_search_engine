@@ -1,0 +1,4 @@
+numpy>=1.26,<3.0
+requests>=2.31,<3.0
+# Optional for MongoDB integration
+pymongo>=4.6,<5.0

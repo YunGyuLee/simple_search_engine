@@ -1,0 +1,9 @@
+{
+  "embedding_mode": "concat",
+  "embedding_model": {
+    "api_url": "https://your-embedding-api/v1/embeddings",
+    "api_key": "YOUR_API_KEY",
+    "model": "text-embedding-model",
+    "timeout": 10
+  }
+}
